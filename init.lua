@@ -29,7 +29,7 @@ local obj = {}
 obj.__index = obj
 
 obj.name = "ClaudeHotkeys"
-obj.version = "0.1.0"
+obj.version = "0.2.0"
 obj.author = "Tom Ellsworth"
 obj.homepage = "https://github.com/tomellsworth/ClaudeHotkeys.spoon"
 obj.license = "MIT - https://opensource.org/licenses/MIT"
@@ -37,6 +37,7 @@ obj.license = "MIT - https://opensource.org/licenses/MIT"
 -- Configuration (override before :start())
 obj.scratchpadPath = nil      -- defaults to ~/.claude/scratchpad
 obj.projectsPath = nil        -- defaults to ~/.claude/projects (for memory hotkey)
+obj.activeProjectFile = nil   -- defaults to ~/.claude/active-project (one project slug per line)
 obj.ocrBinPath = nil          -- defaults to ~/.claude/bin/ocr (compiled on first start)
 obj.modifier = {"ctrl", "alt", "shift"}
 obj.notifications = true      -- show banner notifications on each capture
@@ -161,64 +162,87 @@ function obj:_ocrRegion()
     end, {"-i", "-t", "png", tmpImg}):start()
 end
 
-function obj:_saveToMemory()
-    local text = hs.pasteboard.getContents()
-    if not text or #text == 0 then
-        notify(self, "No memory saved", "Clipboard is empty")
-        return
+-- Resolve which project's memory directory we should write to.
+-- Priority: (1) sentinel file ~/.claude/active-project, (2) most-recently-
+-- touched MEMORY.md, (3) most-recently-touched memory directory.
+function obj:_resolveMemoryDir()
+    -- (1) Sentinel file
+    local sentinel = self.activeProjectFile
+    local sentinelAttrs = hs.fs.attributes(sentinel)
+    if sentinelAttrs and sentinelAttrs.mode == "file" then
+        local f = io.open(sentinel, "r")
+        if f then
+            local slug = (f:read("*l") or ""):gsub("^%s+", ""):gsub("%s+$", "")
+            f:close()
+            if #slug > 0 then
+                local memDir = self.projectsPath .. "/" .. slug .. "/memory"
+                local attrs = hs.fs.attributes(memDir)
+                if attrs and attrs.mode == "directory" then
+                    return memDir, "sentinel"
+                end
+            end
+        end
     end
 
-    -- Find most-recently-touched project memory dir.
-    local target, latest = nil, 0
+    -- (2) Most-recently-modified MEMORY.md
+    local bestByIdx, latestIdx = nil, 0
+    -- (3) Fallback: most-recently-modified directory
+    local bestByDir, latestDir = nil, 0
     for proj in hs.fs.dir(self.projectsPath) do
         if proj:sub(1, 1) ~= "." then
             local memDir = self.projectsPath .. "/" .. proj .. "/memory"
-            local idx = memDir .. "/MEMORY.md"
             local memAttrs = hs.fs.attributes(memDir)
-            local idxAttrs = hs.fs.attributes(idx)
             if memAttrs and memAttrs.mode == "directory" then
-                local mtime = (idxAttrs and idxAttrs.modification) or memAttrs.modification
-                if mtime > latest then latest = mtime; target = memDir end
+                local idx = memDir .. "/MEMORY.md"
+                local idxAttrs = hs.fs.attributes(idx)
+                if idxAttrs and idxAttrs.modification > latestIdx then
+                    latestIdx = idxAttrs.modification
+                    bestByIdx = memDir
+                end
+                if memAttrs.modification > latestDir then
+                    latestDir = memAttrs.modification
+                    bestByDir = memDir
+                end
             end
         end
     end
-    if not target then
-        notify(self, "No memory dir", "Couldn't find a Claude project's memory folder")
-        return
-    end
+    if bestByIdx then return bestByIdx, "newest-MEMORY.md" end
+    if bestByDir then return bestByDir, "newest-dir" end
+    return nil, "none"
+end
 
-    local btn, name = hs.dialog.textPrompt(
-        "Save to Claude memory",
-        "Memory file name (descriptive, no extension):",
-        "", "Next…", "Cancel"
+-- Write a memory file + append index line. Shared by both `_saveToMemory`
+-- (clipboard) and `_saveNote` (free-form input).
+function obj:_writeMemoryNote(target, name, mtype, body)
+    local slug = name:gsub("[^%w_]", "_"):lower()
+    local filename = mtype .. "_" .. slug .. ".md"
+    local path = target .. "/" .. filename
+
+    local firstLine = body:match("^[^\n]+") or name
+    if #firstLine > 120 then firstLine = firstLine:sub(1, 117) .. "..." end
+
+    local fileBody = string.format(
+        "---\nname: %s\ndescription: %s\ntype: %s\n---\n\n%s\n",
+        name, firstLine, mtype, body
     )
-    if btn ~= "Next…" or not name or #name == 0 then return end
+    writeFile(path, fileBody)
 
+    local idx = target .. "/MEMORY.md"
+    if hs.fs.attributes(idx) then
+        local f = io.open(idx, "a")
+        if f then
+            f:write(string.format("- [%s](%s) — %s\n", name, filename, firstLine))
+            f:close()
+        end
+    end
+    return filename
+end
+
+local function chooseTypeAndCommit(self, target, name, body)
     local chooser
     chooser = hs.chooser.new(function(choice)
         if not choice then return end
-        local mtype = choice.text
-        local slug = name:gsub("[^%w_]", "_"):lower()
-        local filename = mtype .. "_" .. slug .. ".md"
-        local path = target .. "/" .. filename
-
-        local firstLine = text:match("^[^\n]+") or name
-        if #firstLine > 120 then firstLine = firstLine:sub(1, 117) .. "..." end
-
-        local body = string.format(
-            "---\nname: %s\ndescription: %s\ntype: %s\n---\n\n%s\n",
-            name, firstLine, mtype, text
-        )
-        writeFile(path, body)
-
-        local idx = target .. "/MEMORY.md"
-        if hs.fs.attributes(idx) then
-            local f = io.open(idx, "a")
-            if f then
-                f:write(string.format("- [%s](%s) — %s\n", name, filename, firstLine))
-                f:close()
-            end
-        end
+        local filename = self:_writeMemoryNote(target, name, choice.text, body)
         notify(self, "Memory saved", target:match("[^/]+/memory$") .. "/" .. filename)
     end)
     chooser:choices({
@@ -228,6 +252,83 @@ function obj:_saveToMemory()
         {text = "reference", subText = "Pointers to external resources"},
     })
     chooser:show()
+end
+
+function obj:_saveToMemory()
+    local text = hs.pasteboard.getContents()
+    if not text or #text == 0 then
+        notify(self, "No memory saved", "Clipboard is empty")
+        return
+    end
+
+    -- Soft warning: if clipboard is just a short file path, that's almost
+    -- certainly not what the user meant to save as a memory.
+    local stripped = text:gsub("^%s+", ""):gsub("%s+$", "")
+    if not stripped:find("\n") and #stripped < 300 and (stripped:match("^/") or stripped:match("^~")) then
+        local attrs = hs.fs.attributes(stripped:gsub("^~", os.getenv("HOME")))
+        if attrs then
+            local proceed = hs.dialog.blockAlert(
+                "Clipboard looks like a file path",
+                "The clipboard contains just a path — probably not what you want as a memory.\n\nPath: " .. stripped,
+                "Save anyway", "Cancel"
+            )
+            if proceed ~= "Save anyway" then return end
+        end
+    end
+
+    local target, source = self:_resolveMemoryDir()
+    if not target then
+        notify(self, "No memory dir", "Couldn't find a Claude project's memory folder")
+        return
+    end
+
+    local btn, name = hs.dialog.textPrompt(
+        "Save to Claude memory",
+        string.format("Memory file name (no extension)\nProject: %s [%s]",
+            target:match("projects/([^/]+)/memory$") or "?", source),
+        "", "Next…", "Cancel"
+    )
+    if btn ~= "Next…" or not name or #name == 0 then return end
+
+    chooseTypeAndCommit(self, target, name, text)
+end
+
+-- ⌃⌥⇧-N: free-form note. Multi-line text dialog → memory file.
+function obj:_saveNote()
+    local target, source = self:_resolveMemoryDir()
+    if not target then
+        notify(self, "No memory dir", "Couldn't find a Claude project's memory folder")
+        return
+    end
+
+    -- hs.dialog.textPrompt is single-line. For multi-line we use osascript
+    -- via a quick AppleScript dialog. Returns the body, then prompts for
+    -- name and type the same way.
+    local script = [[
+        try
+            tell application "System Events"
+                activate
+                set dlg to display dialog "Note body (will become the memory's content):" ¬
+                    default answer "" with title "Claude memory note" ¬
+                    buttons {"Cancel", "Next…"} default button "Next…"
+                return text returned of dlg
+            end tell
+        on error
+            return ""
+        end try
+    ]]
+    local ok, body = hs.osascript.applescript(script)
+    if not ok or not body or #body == 0 then return end
+
+    local btn, name = hs.dialog.textPrompt(
+        "Save to Claude memory",
+        string.format("File name (no extension)\nProject: %s [%s]",
+            target:match("projects/([^/]+)/memory$") or "?", source),
+        "", "Next…", "Cancel"
+    )
+    if btn ~= "Next…" or not name or #name == 0 then return end
+
+    chooseTypeAndCommit(self, target, name, body)
 end
 
 function obj:_revealScratchpad()
@@ -240,6 +341,7 @@ end
 function obj:init()
     self.scratchpadPath = expandTilde(self.scratchpadPath) or (home() .. "/.claude/scratchpad")
     self.projectsPath = expandTilde(self.projectsPath) or (home() .. "/.claude/projects")
+    self.activeProjectFile = expandTilde(self.activeProjectFile) or (home() .. "/.claude/active-project")
     self.ocrBinPath = expandTilde(self.ocrBinPath) or (home() .. "/.claude/bin/ocr")
     return self
 end
@@ -261,6 +363,7 @@ function obj:_defaultMap()
         text       = {m, "C"},
         ocr        = {m, "T"},
         memory     = {m, "M"},
+        note       = {m, "N"},
         reveal     = {m, "F"},
     }
 end
@@ -283,6 +386,7 @@ function obj:start()
         text       = function() self:_captureText() end,
         ocr        = function() self:_ocrRegion() end,
         memory     = function() self:_saveToMemory() end,
+        note       = function() self:_saveNote() end,
         reveal     = function() self:_revealScratchpad() end,
     }
     for key, binding in pairs(map) do
@@ -292,7 +396,7 @@ function obj:start()
     end
 
     if self.notifications then
-        hs.alert.show("Claude hotkeys loaded\n" .. table.concat(self.modifier, "+") .. " + 4/5/C/T/M/F")
+        hs.alert.show("Claude hotkeys loaded\n" .. table.concat(self.modifier, "+") .. " + 4/5/C/T/M/N/F")
     end
     return self
 end
