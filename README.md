@@ -25,7 +25,7 @@ The point: a single keyboard pattern that doesn't fight with `⌘`-shortcuts in 
 ### Install the Spoon
 
 ```bash
-git clone https://github.com/tellswork/ClaudeHotkeys.spoon \
+git clone https://github.com/fonetikly/ClaudeHotkeys.spoon \
     ~/.hammerspoon/Spoons/ClaudeHotkeys.spoon
 ```
 

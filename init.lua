@@ -31,7 +31,7 @@ obj.__index = obj
 obj.name = "ClaudeHotkeys"
 obj.version = "0.2.0"
 obj.author = "Tom Ellsworth"
-obj.homepage = "https://github.com/tellswork/ClaudeHotkeys.spoon"
+obj.homepage = "https://github.com/fonetikly/ClaudeHotkeys.spoon"
 obj.license = "MIT - https://opensource.org/licenses/MIT"
 
 -- Configuration (override before :start())

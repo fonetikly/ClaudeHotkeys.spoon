@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # One-shot installer for ClaudeHotkeys.spoon.
-#   curl -sSL https://raw.githubusercontent.com/tellswork/ClaudeHotkeys.spoon/main/install.sh | bash
+#   curl -sSL https://raw.githubusercontent.com/fonetikly/ClaudeHotkeys.spoon/main/install.sh | bash
 set -euo pipefail
 
 SPOON_DIR="$HOME/.hammerspoon/Spoons/ClaudeHotkeys.spoon"
-REPO_RAW="${CLAUDEHK_REPO_RAW:-https://raw.githubusercontent.com/tellswork/ClaudeHotkeys.spoon/main}"
+REPO_RAW="${CLAUDEHK_REPO_RAW:-https://raw.githubusercontent.com/fonetikly/ClaudeHotkeys.spoon/main}"
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 warn() { printf '\033[33m%s\033[0m\n' "$*"; }
