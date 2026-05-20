@@ -1,2 +1,6 @@
 .DS_Store
 *.swp
+
+# Compiled Swift helpers — built from sources on first use by the Spoon
+ocr
+markup
