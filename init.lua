@@ -29,7 +29,7 @@ local obj = {}
 obj.__index = obj
 
 obj.name = "ClaudeHotkeys"
-obj.version = "0.2.0"
+obj.version = "0.3.0"
 obj.author = "Tom Ellsworth"
 obj.homepage = "https://github.com/fonetikly/ClaudeHotkeys.spoon"
 obj.license = "MIT - https://opensource.org/licenses/MIT"
@@ -39,6 +39,8 @@ obj.scratchpadPath = nil      -- defaults to ~/.claude/scratchpad
 obj.projectsPath = nil        -- defaults to ~/.claude/projects (for memory hotkey)
 obj.activeProjectFile = nil   -- defaults to ~/.claude/active-project (one project slug per line)
 obj.ocrBinPath = nil          -- defaults to ~/.claude/bin/ocr (compiled on first start)
+obj.markupBinPath = nil       -- defaults to ~/.claude/bin/markup (compiled on first start)
+obj.markupBeforeSend = true   -- if true, ⌃⌥⇧-4 / ⌃⌥⇧-5 route through the markup popup
 obj.modifier = {"ctrl", "alt", "shift"}
 obj.notifications = true      -- show banner notifications on each capture
 obj.hotkeyMap = nil           -- user-provided override map
@@ -78,51 +80,84 @@ local function ensureDir(path)
     hs.fs.mkdir(path)
 end
 
--- Compile the OCR helper if its source ships next to the Spoon and the
--- compiled binary doesn't exist (or is older than the source).
-local function ensureOCRCompiled(self)
-    local bin = self.ocrBinPath
-    local source = self._spoonPath .. "/ocr.swift"
+-- Compile a Swift helper that ships next to the Spoon if its binary doesn't
+-- exist yet or is older than the source. Used for both `ocr` and `markup`.
+local function compileSwiftHelper(self, sourceFile, binPath)
+    local source = self._spoonPath .. "/" .. sourceFile
     local sourceAttrs = hs.fs.attributes(source)
-    if not sourceAttrs then return false end  -- no source, can't help
+    if not sourceAttrs then return false end
 
-    local binAttrs = hs.fs.attributes(bin)
+    local binAttrs = hs.fs.attributes(binPath)
     if binAttrs and binAttrs.modification >= sourceAttrs.modification then
-        return true  -- already up to date
+        return true
     end
 
-    ensureDir(bin:match("(.*)/[^/]+$"))
-    local cmd = string.format("swiftc %q -o %q", source, bin)
+    ensureDir(binPath:match("(.*)/[^/]+$"))
+    local cmd = string.format("swiftc %q -o %q", source, binPath)
     local ok = hs.execute(cmd)
     if ok then
         return true
     else
-        hs.alert("ClaudeHotkeys: OCR compile failed — install Xcode CLT (xcode-select --install)")
+        hs.alert("ClaudeHotkeys: " .. sourceFile .. " compile failed — install Xcode CLT (xcode-select --install)")
         return false
     end
+end
+
+local function ensureOCRCompiled(self)
+    return compileSwiftHelper(self, "ocr.swift", self.ocrBinPath)
+end
+
+local function ensureMarkupCompiled(self)
+    return compileSwiftHelper(self, "markup.swift", self.markupBinPath)
 end
 
 -- ──────────────────────────────────────────────────────────────────────
 -- hotkey actions
 
-function obj:_screenshotRegion()
-    local path = self.scratchpadPath .. "/screenshots/" .. timestamp() .. ".png"
+-- Capture → optionally markup popup → save to scratchpad.
+-- If markupBeforeSend is true and markup binary is available, the raw
+-- capture is treated as a temporary, and only the marked-up version lands
+-- in scratchpad. On cancel, nothing is saved.
+function obj:_captureAndMaybeMarkup(captureArgs, label)
+    local ts = timestamp()
+    local rawPath = "/tmp/claude_capture_" .. ts .. ".png"
+    local outPath = self.scratchpadPath .. "/screenshots/" .. ts .. ".png"
+    local args = {}
+    for _, a in ipairs(captureArgs) do table.insert(args, a) end
+    table.insert(args, rawPath)
+
     hs.task.new("/usr/sbin/screencapture", function(rc)
-        if rc == 0 and hs.fs.attributes(path) then
-            hs.pasteboard.setContents(path)
-            notify(self, "Screenshot → Claude", "Path on clipboard")
+        if rc ~= 0 or not hs.fs.attributes(rawPath) then return end
+
+        if not self.markupBeforeSend or not ensureMarkupCompiled(self) then
+            -- Markup disabled or unavailable: just move the raw capture in.
+            os.rename(rawPath, outPath)
+            hs.pasteboard.setContents(outPath)
+            notify(self, label .. " → Claude", "Saved (markup skipped)")
+            return
         end
-    end, {"-i", "-t", "png", path}):start()
+
+        -- Hand the raw capture to the markup helper. It writes the baked
+        -- version to outPath on Send, or exits non-zero on Cancel.
+        local mk = hs.task.new(self.markupBinPath, function(rcMk)
+            os.remove(rawPath)
+            if rcMk == 0 and hs.fs.attributes(outPath) then
+                hs.pasteboard.setContents(outPath)
+                notify(self, label .. " → Claude", "Path on clipboard")
+            else
+                notify(self, label .. " cancelled", "Nothing saved to scratchpad")
+            end
+        end, {rawPath, outPath})
+        mk:start()
+    end, args):start()
+end
+
+function obj:_screenshotRegion()
+    self:_captureAndMaybeMarkup({"-i", "-t", "png"}, "Screenshot")
 end
 
 function obj:_screenshotFull()
-    local path = self.scratchpadPath .. "/screenshots/" .. timestamp() .. ".png"
-    hs.task.new("/usr/sbin/screencapture", function(rc)
-        if rc == 0 and hs.fs.attributes(path) then
-            hs.pasteboard.setContents(path)
-            notify(self, "Full screenshot → Claude", path)
-        end
-    end, {"-m", "-t", "png", path}):start()
+    self:_captureAndMaybeMarkup({"-m", "-t", "png"}, "Full screenshot")
 end
 
 function obj:_captureText()
@@ -343,6 +378,7 @@ function obj:init()
     self.projectsPath = expandTilde(self.projectsPath) or (home() .. "/.claude/projects")
     self.activeProjectFile = expandTilde(self.activeProjectFile) or (home() .. "/.claude/active-project")
     self.ocrBinPath = expandTilde(self.ocrBinPath) or (home() .. "/.claude/bin/ocr")
+    self.markupBinPath = expandTilde(self.markupBinPath) or (home() .. "/.claude/bin/markup")
     return self
 end
 
@@ -376,8 +412,9 @@ function obj:start()
     end
     ensureDir(self.ocrBinPath:match("(.*)/[^/]+$"))
 
-    -- Compile OCR helper if needed (silent — we'll lazy-compile on first use too)
+    -- Compile Swift helpers up front; lazy-compile fallback exists too.
     ensureOCRCompiled(self)
+    ensureMarkupCompiled(self)
 
     local map = self.hotkeyMap or self:_defaultMap()
     local actions = {
